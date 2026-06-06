@@ -1,3 +1,9 @@
+import { createClient } from "@/lib/supabase/server";
+import {
+  getOrCreateUserUsage,
+  isUsageLimitReached,
+  USAGE_LIMIT_MESSAGE,
+} from "@/lib/usage";
 import OpenAI from "openai";
 import { NextResponse } from "next/server";
 
@@ -33,6 +39,34 @@ Die E-Mail soll so wirken, als kenne der Absender die Situation des Empfängers.
 }
 
 export async function POST(request: Request) {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) {
+    return NextResponse.json(
+      { error: "Nicht autorisiert. Bitte anmelden." },
+      { status: 401 },
+    );
+  }
+
+  const { usage, error: usageError } = await getOrCreateUserUsage(
+    supabase,
+    user.id,
+  );
+
+  if (usageError || !usage) {
+    return NextResponse.json(
+      { error: "Nutzungsdaten konnten nicht geladen werden." },
+      { status: 500 },
+    );
+  }
+
+  if (isUsageLimitReached(usage)) {
+    return NextResponse.json({ error: USAGE_LIMIT_MESSAGE }, { status: 429 });
+  }
+
   const apiKey = process.env.OPENAI_API_KEY;
 
   if (!apiKey) {
@@ -109,6 +143,15 @@ export async function POST(request: Request) {
         { error: "Ungültiges Antwortformat von der KI." },
         { status: 502 },
       );
+    }
+
+    const { error: incrementError } = await supabase
+      .from("user_usage")
+      .update({ email_count: usage.email_count + 1 })
+      .eq("user_id", user.id);
+
+    if (incrementError) {
+      console.error("Usage increment error:", incrementError);
     }
 
     return NextResponse.json({

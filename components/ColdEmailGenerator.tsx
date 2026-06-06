@@ -1,7 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import type { GenerateEmailResponse } from "@/app/api/generate/route";
+import type { UsageResponse } from "@/app/api/usage/route";
+import { USAGE_LIMIT_MESSAGE } from "@/lib/usage";
 
 type FormState = {
   name: string;
@@ -16,11 +19,55 @@ const initialForm: FormState = {
 };
 
 export function ColdEmailGenerator() {
+  const searchParams = useSearchParams();
   const [form, setForm] = useState<FormState>(initialForm);
   const [result, setResult] = useState<GenerateEmailResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [upgrading, setUpgrading] = useState(false);
+  const [upgradeSuccess, setUpgradeSuccess] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [usage, setUsage] = useState<UsageResponse | null>(null);
+
+  const limitReached = usage?.limit_reached ?? false;
+
+  const fetchUsage = useCallback(async () => {
+    try {
+      const res = await fetch("/api/usage");
+      if (!res.ok) return;
+      const data = (await res.json()) as UsageResponse;
+      setUsage(data);
+    } catch {
+      // Nutzungsanzeige ist optional – Generierung bleibt über die API geschützt.
+    }
+  }, []);
+
+  useEffect(() => {
+    void fetchUsage();
+  }, [fetchUsage]);
+
+  useEffect(() => {
+    if (searchParams.get("upgraded") !== "1") return;
+
+    setUpgradeSuccess(true);
+    window.history.replaceState({}, "", "/");
+
+    const poll = async () => {
+      for (let i = 0; i < 10; i++) {
+        await new Promise((r) => setTimeout(r, 1500));
+        const res = await fetch("/api/usage");
+        if (!res.ok) continue;
+        const data = (await res.json()) as UsageResponse;
+        if (data.is_pro) {
+          setUsage(data);
+          return;
+        }
+      }
+      void fetchUsage();
+    };
+
+    void poll();
+  }, [searchParams, fetchUsage]);
 
   function updateField<K extends keyof FormState>(key: K, value: FormState[K]) {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -51,10 +98,32 @@ export function ColdEmailGenerator() {
       }
 
       setResult({ subject: data.subject, body: data.body });
+      void fetchUsage();
     } catch {
       setError("Netzwerkfehler. Bitte später erneut versuchen.");
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleUpgrade() {
+    setUpgrading(true);
+    setError(null);
+
+    try {
+      const res = await fetch("/api/stripe/checkout", { method: "POST" });
+      const data = (await res.json()) as { url?: string; error?: string };
+
+      if (!res.ok || !data.url) {
+        setError(data.error ?? "Upgrade konnte nicht gestartet werden.");
+        return;
+      }
+
+      window.location.href = data.url;
+    } catch {
+      setError("Netzwerkfehler. Bitte später erneut versuchen.");
+    } finally {
+      setUpgrading(false);
     }
   }
 
@@ -84,6 +153,23 @@ export function ColdEmailGenerator() {
           Beschreibe deinen Empfänger – wir schreiben eine personalisierte
           Erstnachricht für dich.
         </p>
+        {usage?.is_pro && (
+          <p className="mt-2 text-sm font-medium text-[var(--accent)]">
+            Pro – unbegrenzte E-Mails
+          </p>
+        )}
+        {usage && !usage.is_pro && (
+          <p className="mt-2 text-sm text-[var(--muted)]">
+            {usage.remaining === 0
+              ? "Keine kostenlosen E-Mails mehr übrig."
+              : `${usage.remaining} von ${usage.free_limit} kostenlosen E-Mails übrig`}
+          </p>
+        )}
+        {upgradeSuccess && usage?.is_pro && (
+          <p className="mt-2 text-sm font-medium text-emerald-400">
+            Upgrade erfolgreich! Du kannst jetzt unbegrenzt E-Mails generieren.
+          </p>
+        )}
       </header>
 
       <form
@@ -153,29 +239,48 @@ export function ColdEmailGenerator() {
           </div>
         </div>
 
-        {error && (
-          <p
+        {(error || limitReached) && (
+          <div
             role="alert"
             className="mt-4 rounded-lg border border-[var(--error)]/40 bg-[var(--error)]/10 px-4 py-3 text-sm text-[var(--error)]"
           >
-            {error}
-          </p>
+            <p>{limitReached ? USAGE_LIMIT_MESSAGE : error}</p>
+            {limitReached && (
+              <button
+                type="button"
+                onClick={handleUpgrade}
+                disabled={upgrading}
+                className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg bg-[var(--accent)] px-4 py-2.5 font-semibold text-white transition-colors hover:bg-[var(--accent-hover)] disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {upgrading ? (
+                  <>
+                    <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+                    Weiterleitung zu Stripe …
+                  </>
+                ) : (
+                  "Upgrade auf Pro"
+                )}
+              </button>
+            )}
+          </div>
         )}
 
-        <button
-          type="submit"
-          disabled={loading}
-          className="mt-6 flex w-full items-center justify-center gap-2 rounded-lg bg-[var(--accent)] px-4 py-3 font-semibold text-white transition-colors hover:bg-[var(--accent-hover)] disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          {loading ? (
-            <>
-              <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
-              E-Mail wird generiert …
-            </>
-          ) : (
-            "Cold Email generieren"
-          )}
-        </button>
+        {!limitReached && (
+          <button
+            type="submit"
+            disabled={loading}
+            className="mt-6 flex w-full items-center justify-center gap-2 rounded-lg bg-[var(--accent)] px-4 py-3 font-semibold text-white transition-colors hover:bg-[var(--accent-hover)] disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {loading ? (
+              <>
+                <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+                E-Mail wird generiert …
+              </>
+            ) : (
+              "Cold Email generieren"
+            )}
+          </button>
+        )}
       </form>
 
       {result && (
